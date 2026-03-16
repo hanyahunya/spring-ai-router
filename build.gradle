@@ -6,7 +6,10 @@ plugins {
 }
 
 bootJar { enabled = false }
-jar { enabled = true }
+jar {
+	enabled = true
+	archiveClassifier = ''
+}
 
 group = 'com.hanyahunya'
 version = '0.0.1-SNAPSHOT'

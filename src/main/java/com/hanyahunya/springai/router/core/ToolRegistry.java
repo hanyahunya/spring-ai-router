@@ -1,41 +1,52 @@
 package com.hanyahunya.springai.router.core;
 
 import com.hanyahunya.springai.router.llm.LLMClient;
-import jakarta.annotation.PostConstruct;
+import org.springframework.context.ApplicationListener;
+import org.springframework.context.event.ContextRefreshedEvent;
 
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
-/**
- * 스캔된 Tool 목록을 관리하고 LLM에 전달할 형태로 변환합니다.
- */
-public class ToolRegistry {
+public class ToolRegistry implements ApplicationListener<ContextRefreshedEvent> {
 
     private final AIToolScanner scanner;
-    private List<RegisteredTool> tools;
+    private List<RegisteredTool> registeredTools;
+    private boolean initialized = false;
 
     public ToolRegistry(AIToolScanner scanner) {
         this.scanner = scanner;
     }
 
-    @PostConstruct
-    public void init() {
-        this.tools = scanner.scanTools();
+    /**
+     * 모든 빈이 완전히 초기화된 후 실행됨.
+     * @PostConstruct 대신 사용 → 순환 참조 방지
+     */
+    @Override
+    public void onApplicationEvent(ContextRefreshedEvent event) {
+        if (!initialized) {
+            this.registeredTools = scanner.scanTools();
+            this.initialized = true;
+        }
     }
 
     public List<LLMClient.ToolSpec> getToolSpecs() {
-        return tools.stream()
+        return registeredTools.stream()
                 .map(t -> new LLMClient.ToolSpec(
                         t.getName(),
                         t.getDescription(),
-                        t.getParameterSchema()))
+                        t.getParameterSchema()
+                ))
                 .collect(Collectors.toList());
     }
 
     public Optional<RegisteredTool> findByName(String name) {
-        return tools.stream().filter(t -> t.getName().equals(name)).findFirst();
+        return registeredTools.stream()
+                .filter(t -> t.getName().equals(name))
+                .findFirst();
     }
 
-    public int getToolCount() { return tools.size(); }
+    public List<RegisteredTool> getAllTools() {
+        return registeredTools;
+    }
 }

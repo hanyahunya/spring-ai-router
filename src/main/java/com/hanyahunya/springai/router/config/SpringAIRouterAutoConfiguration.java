@@ -16,28 +16,16 @@ import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.ApplicationListener;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.event.ContextRefreshedEvent;
 
-
-/**
- * Spring AI Router 자동 설정.
- *
- * 의존성 추가만 해도 동작합니다.
- * application.yml의 spring-ai-router.* 로 동작을 제어합니다.
- *
- * Bean 우선순위:
- *  - LLMClient    : 사용자 Bean > provider 설정 기반 자동 생성
- *  - SessionStore : 사용자 Bean > InMemorySessionStore (기본값)
- *  - UsageTracker : 사용자 Bean > InMemoryUsageTracker (기본값)
- */
 @AutoConfiguration
 @EnableConfigurationProperties(SpringAIRouterProperties.class)
 @ConditionalOnProperty(prefix = "spring-ai-router", name = "enabled", matchIfMissing = true)
 public class SpringAIRouterAutoConfiguration {
 
     // ── LLM 클라이언트 ─────────────────────────────────────────────
-    // provider 값에 따라 셋 중 하나만 등록됨
-    // 사용자가 LLMClient Bean을 직접 등록하면 아래 셋 모두 무시됨
 
     @Bean
     @ConditionalOnMissingBean(LLMClient.class)
@@ -113,6 +101,24 @@ public class SpringAIRouterAutoConfiguration {
                 sessionStore, usageTracker, props);
     }
 
+    /**
+     * Gemini explicit 캐시 초기화.
+     * 모든 빈이 완전히 준비된 후(ContextRefreshedEvent) 실행되어
+     * ToolRegistry의 Tool 목록이 이미 채워진 상태에서 캐시를 생성합니다.
+     *
+     * Gemini 이외의 공급자는 아무 동작도 하지 않습니다.
+     */
+    @Bean
+    public ApplicationListener<ContextRefreshedEvent> geminiCacheInitializer(
+            LLMClient llmClient,
+            ToolRegistry toolRegistry) {
+        return event -> {
+            if (llmClient instanceof GeminiClient geminiClient) {
+                geminiClient.initializeCache(toolRegistry.getToolSpecs());
+            }
+        };
+    }
+
     // ── 유틸 ───────────────────────────────────────────────────────
 
     private void validateApiKey(SpringAIRouterProperties props, String provider) {
@@ -124,4 +130,3 @@ public class SpringAIRouterAutoConfiguration {
         }
     }
 }
-

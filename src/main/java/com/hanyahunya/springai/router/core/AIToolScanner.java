@@ -21,6 +21,12 @@ import java.util.*;
  * 2. @AIHidden 붙은 메서드는 제외
  * 3. @AITool description 있으면 우선 사용, 없으면 "HTTP메서드 /경로" 자동 생성
  * 4. @AIParam 있으면 그 설명 사용, 없으면 필드명/파라미터명으로 유추
+ *
+ * ── Tool 순서 보장 (캐시 히트를 위해 중요) ──────────────────────
+ * JVM의 getDeclaredMethods()는 호출마다 순서가 달라질 수 있습니다.
+ * Tool 순서가 바뀌면 LLM에 전달되는 prefix가 달라져 캐시 미스 발생.
+ * → 메서드명 + 필드명을 알파벳순으로 정렬하여 항상 동일한 순서 보장.
+ * → 사용자가 메서드명/필드명을 변경하지 않는 한 캐시가 유지됩니다.
  */
 public class AIToolScanner implements ApplicationContextAware {
 
@@ -35,23 +41,23 @@ public class AIToolScanner implements ApplicationContextAware {
         List<RegisteredTool> tools = new ArrayList<>();
 
         for (String beanName : applicationContext.getBeanDefinitionNames()) {
-            Object bean = applicationContext.getBean(beanName);
+            Object   bean      = applicationContext.getBean(beanName);
             Class<?> beanClass = getTargetClass(bean);
 
             if (!beanClass.isAnnotationPresent(AIController.class)) continue;
 
-            for (Method method : beanClass.getDeclaredMethods()) {
-                // @AIHidden 이면 무조건 제외
+            // ── 메서드 알파벳순 정렬 ────────────────────────────────
+            // 동일한 순서 보장 → LLM prefix 일치 → 캐시 히트 유지
+            Method[] methods = beanClass.getDeclaredMethods();
+            Arrays.sort(methods, Comparator.comparing(Method::getName));
+
+            for (Method method : methods) {
                 if (method.isAnnotationPresent(AIHidden.class)) continue;
 
-                // Spring 매핑 어노테이션이 있는 메서드만 대상
                 String[] httpInfo = extractHttpInfo(method);
                 if (httpInfo == null) continue;
 
-                // description: @AITool 있으면 우선, 없으면 "POST /users" 자동 생성
-                String description = resolveDescription(method, httpInfo);
-
-                // 파라미터 스키마 (@AIParam 포함)
+                String              description = resolveDescription(method, httpInfo);
                 Map<String, Object> paramSchema = buildParameterSchema(method);
 
                 tools.add(new RegisteredTool(
@@ -64,6 +70,9 @@ public class AIToolScanner implements ApplicationContextAware {
             }
         }
 
+        // ── 최종 정렬: 여러 @AIController 클래스가 있을 때도 순서 고정
+        tools.sort(Comparator.comparing(RegisteredTool::getName));
+
         return tools;
     }
 
@@ -74,7 +83,6 @@ public class AIToolScanner implements ApplicationContextAware {
         if (aiTool != null && !aiTool.description().isBlank()) {
             return aiTool.description();
         }
-        // 자동 생성: "POST /users"
         return httpInfo[0] + " " + httpInfo[1];
     }
 
@@ -82,16 +90,16 @@ public class AIToolScanner implements ApplicationContextAware {
 
     private String[] extractHttpInfo(Method method) {
         if (method.isAnnotationPresent(GetMapping.class)) {
-            return new String[]{"GET", firstPath(method.getAnnotation(GetMapping.class).value())};
+            return new String[]{"GET",    firstPath(method.getAnnotation(GetMapping.class).value())};
         }
         if (method.isAnnotationPresent(PostMapping.class)) {
-            return new String[]{"POST", firstPath(method.getAnnotation(PostMapping.class).value())};
+            return new String[]{"POST",   firstPath(method.getAnnotation(PostMapping.class).value())};
         }
         if (method.isAnnotationPresent(PutMapping.class)) {
-            return new String[]{"PUT", firstPath(method.getAnnotation(PutMapping.class).value())};
+            return new String[]{"PUT",    firstPath(method.getAnnotation(PutMapping.class).value())};
         }
         if (method.isAnnotationPresent(PatchMapping.class)) {
-            return new String[]{"PATCH", firstPath(method.getAnnotation(PatchMapping.class).value())};
+            return new String[]{"PATCH",  firstPath(method.getAnnotation(PatchMapping.class).value())};
         }
         if (method.isAnnotationPresent(DeleteMapping.class)) {
             return new String[]{"DELETE", firstPath(method.getAnnotation(DeleteMapping.class).value())};
@@ -117,9 +125,7 @@ public class AIToolScanner implements ApplicationContextAware {
             Class<?> type = param.getType();
 
             if (param.isAnnotationPresent(RequestBody.class)) {
-                // @RequestBody → 내부 필드 재귀 추출
                 properties.putAll(extractFieldSchema(type));
-                // 파라미터 자체에 @AIParam 있으면 본문 설명 추가
                 if (param.isAnnotationPresent(AIParam.class)) {
                     properties.put("_description",
                             Map.of("description", param.getAnnotation(AIParam.class).value()));
@@ -127,14 +133,11 @@ public class AIToolScanner implements ApplicationContextAware {
                 continue;
             }
 
-            String paramName = extractParamName(param);
-            Map<String, Object> schema = new LinkedHashMap<>(toJsonSchemaType(type));
-
-            // @AIParam 있으면 description 추가
+            String              paramName = extractParamName(param);
+            Map<String, Object> schema    = new LinkedHashMap<>(toJsonSchemaType(type));
             if (param.isAnnotationPresent(AIParam.class)) {
                 schema.put("description", param.getAnnotation(AIParam.class).value());
             }
-
             properties.put(paramName, schema);
         }
 
@@ -144,28 +147,29 @@ public class AIToolScanner implements ApplicationContextAware {
     private Map<String, Object> extractFieldSchema(Class<?> clazz) {
         Map<String, Object> properties = new LinkedHashMap<>();
 
-        for (Field field : getAllFields(clazz)) {
-            String fieldName = field.getName();
+        // 필드도 알파벳순 정렬 → schema 내부 순서 고정 → 캐시 히트 유지
+        List<Field> fields = getAllFields(clazz);
+        fields.sort(Comparator.comparing(Field::getName));
+
+        for (Field field : fields) {
+            String   fieldName = field.getName();
             Class<?> fieldType = field.getType();
 
             Map<String, Object> schema = new LinkedHashMap<>();
-
             if (isSimpleType(fieldType)) {
                 schema.putAll(toJsonSchemaType(fieldType));
             } else if (Collection.class.isAssignableFrom(fieldType)) {
                 schema.put("type", "array");
             } else if (!fieldType.isPrimitive() && !fieldType.getName().startsWith("java")) {
-                schema.put("type", "object");
+                schema.put("type",       "object");
                 schema.put("properties", extractFieldSchema(fieldType));
             } else {
                 schema.putAll(toJsonSchemaType(fieldType));
             }
 
-            // @AIParam 있으면 description 추가
             if (field.isAnnotationPresent(AIParam.class)) {
                 schema.put("description", field.getAnnotation(AIParam.class).value());
             }
-
             properties.put(fieldName, schema);
         }
 
@@ -175,8 +179,8 @@ public class AIToolScanner implements ApplicationContextAware {
     // ── 유틸 ──────────────────────────────────────────────────────
 
     private List<Field> getAllFields(Class<?> clazz) {
-        List<Field> fields = new ArrayList<>();
-        Class<?> current = clazz;
+        List<Field> fields  = new ArrayList<>();
+        Class<?>    current = clazz;
         while (current != null && current != Object.class) {
             fields.addAll(Arrays.asList(current.getDeclaredFields()));
             current = current.getSuperclass();
@@ -193,12 +197,12 @@ public class AIToolScanner implements ApplicationContextAware {
     }
 
     private Map<String, Object> toJsonSchemaType(Class<?> type) {
-        if (type == String.class)                                       return Map.of("type", "string");
-        if (type == Boolean.class || type == boolean.class)             return Map.of("type", "boolean");
+        if (type == String.class)                                   return Map.of("type", "string");
+        if (type == Boolean.class || type == boolean.class)         return Map.of("type", "boolean");
         if (type == Long.class    || type == long.class
-                || type == Integer.class || type == int.class)                 return Map.of("type", "integer");
+                || type == Integer.class || type == int.class)             return Map.of("type", "integer");
         if (type == Double.class  || type == double.class
-                || type == Float.class   || type == float.class)               return Map.of("type", "number");
+                || type == Float.class   || type == float.class)           return Map.of("type", "number");
         if (type.isEnum()) {
             List<String> values = new ArrayList<>();
             for (Object c : type.getEnumConstants()) values.add(c.toString());
